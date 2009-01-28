@@ -914,7 +914,7 @@ class SBMLToCellML
 
     add_math_apply_eq(component, ivvar) { |apply| yield(apply) }
 
-    ivvvar
+    ivvar
   end
 
   def process_species
