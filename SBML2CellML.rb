@@ -956,7 +956,7 @@ class SBMLToCellML
                 adiv = apply.add_element('apply')
                 adiv.add_element('divide')
                 cn = adiv.add_element('cn', {'cellml:units' => species_substance_units(el)}).
-                       add_text(initialConcentrationAt.value)
+                       add_text(initialAmountAt.value)
                 adiv.add_element('ci').add_text('size')
               }
           else
