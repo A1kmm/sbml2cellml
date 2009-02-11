@@ -5,6 +5,11 @@ require 'rexml/document'
 MathExpressionChild = '*[self::ci or self::cn or self::csymbol or self::apply or self::exponentiale or self::imaginaryi or self::notanumber or self::true or self::false or self::emptyset or self::pi or self::eulergamma or self::infinity or self::piecewise]'
 MathAnyChild = '*[self::cn or self::ci or self::csymbol or self::apply or self::reln or self::fn or self::interval or self::inverse or self::sep or self::condition or self::declare or self::lambda or self::compose or self::ident or self::domain or self::codomain or self::image or self::domainofapplication or self::piecewise or self::piece or self::otherwise or self::quotient or self::factorial or self::divide or self::max or self::min or self::minus or self::power or self::rem or self::times or self::root or self::gcd or self::and or self::or or self::xor or self::not or self::implies or self::forall or self::exists or self::abs or self::conjugate or self::arg or self::real or self::imaginary or self::lcm or self::floor or self::ceiling or self::eq or self::neq or self::gt or self::lt or self::geq or self::leq or self::equivalent or self::approx or self::factorof or self::int or self::diff or self::partialdiff or self::lowlimit or self::uplimit or self::bvar or self::degree or self::divergence or self::grad or self::curl or self::laplacian or self::set or self::list or self::union or self::intersect or self::in or self::notin or self::subset or self::prsubset or self::notsubset or self::notprsubset or self::setdiff or self::card or self::cartesianproduct or self::sum or self::product or self::limit or self::tendsto or self::exp or self::ln or self::log or self::mean or self::sdev or self::variance or self::median or self::mode or self::moment or self::momentabout or self::vector or self::matrix or self::matrixrow or self::determinant or self::transpose or self::selector or self::vectorproduct or self::scalarproduct or self::outerproduct or self::integers or self::reals or self::rationals or self::naturalnumbers or self::complexes or self::primes or self::exponentiale or self::imaginaryi or self::notanumber or self::true or self::false or self::emptyset or self::pi or self::eulergamma or self::infinity or self::plus]'
 
+require 'caching-xpath'
+require 'rexml-performance-monkeypatch'
+
+$xpath = CachingXPath.new
+
 class SBMLError < Exception
   def initialize(why)
     @why = why
@@ -253,7 +258,11 @@ class UnitInferenceEngine
 
     apply_rule (['eq', 'neq', 'gt', 'lt', 'geq', 'leq', 'equivalent', 'approx']) { |apply, children|
       # Arguments are of the same type...
-      next if children.inject(true) { |m,c| m and not @inferred[c].nil? }
+      if (children.inject(true) { |m,c| m and not @inferred[c].nil? })
+        blacklist apply
+        next
+      end
+
       utype = nil
       children.each { |x|
         if not @inferred[x].nil?
@@ -268,7 +277,11 @@ class UnitInferenceEngine
 
     apply_rule (['factorial', 'gcd', 'lcm', 'factorof', 'exp', 'ln', 'log']) { |apply, children|
       # Both the child and arguments are dimensionless...
-      next if children.inject(!@inferred[apply].nil?) { |m,c| m and not @inferred[c].nil? }
+      if children.inject(!@inferred[apply].nil?) { |m,c| m and not @inferred[c].nil? }
+        blacklist apply
+        next
+      end
+
       @did_work = true
       @inferred[apply] = Units::Dimensionless
       children.each { |c| @inferred[c] = Units::Dimensionless }
@@ -276,9 +289,16 @@ class UnitInferenceEngine
 
     apply_rule (['times']) { |apply, children|
       # Exactly one of the parent and children have unknown dimensions...
-      next unless (children + [apply]).inject(0) { |m,c|
+      undefcount = (children + [apply]).inject(0) { |m,c|
         case @inferred[c].nil? when true then m + 1 else m end
-      } == 1
+      }
+      if undefcount != 1
+        if undefcount == 0
+          blacklist apply
+        end
+        next
+      end
+
       @did_work = true
 
       units = Units::Dimensionless
@@ -301,9 +321,13 @@ class UnitInferenceEngine
 
     apply_rule(['quotient', 'divide', 'rem']) { |apply, children|
       # Exactly one of the parent and children have unknown dimensions...
-      next unless (children + [apply]).inject(0) { |m,c|
+      undefcount = (children + [apply]).inject(0) { |m,c|
         case @inferred[c].nil? when true then m + 1 else m end
-      } == 1
+      }
+      if undefcount != 1
+        blacklist(apply) if undefcount == 0
+        next
+      end
 
       @did_work = true
 
@@ -334,7 +358,10 @@ class UnitInferenceEngine
         @inferred[children[1]] = Units::Dimensionless
       end
 
-      next unless @inferred[children[0]].nil? ^ @inferred[apply].nil?
+      if not (@inferred[children[0]].nil? ^ @inferred[apply].nil?)
+        blacklist(apply) unless (@inferred[children[0]].nil? or @inferred[apply].nil?)
+        next
+      end
 
       # Is children[1] a constant?
       # Note that we could be smarter and compute constants here.
@@ -351,7 +378,7 @@ class UnitInferenceEngine
     }
 
     apply_rule (['root']) { |apply,children|
-      degs = REXML::XPath.match(apply, "degree/" + MathExpressionChild)
+      degs = $xpath.match(apply, "degree/" + MathExpressionChild)
       if degs.length == 0
         degree = 2.0
       else
@@ -365,7 +392,10 @@ class UnitInferenceEngine
         degree = degs[0].text.strip.to_f
       end
 
-      next unless @inferred[children[0]].nil? ^ @inferred[apply].nil?
+      if not(@inferred[children[0]].nil? ^ @inferred[apply].nil?)
+        blacklist(apply) unless (@inferred[children[0]].nil? or @inferred[apply].nil?)
+        next
+      end
 
       @did_work = true
       exponent = 1.0 / degree
@@ -379,7 +409,7 @@ class UnitInferenceEngine
 
     apply_rule (['int']) { |apply,children|
       # bvar, lowlimit, uplimit all have the same units...
-      boundtypes = REXML::XPath.match(apply, '(bvar or lowlimit or uplimit)/' + MathExpressionChild)
+      boundtypes = $xpath.match(apply, '(bvar or lowlimit or uplimit)/' + MathExpressionChild)
       boundtype = boundtypes.find { |el| next if @inferred[el].nil?; break @inferred[el]}
       if not boundtype.nil?
         boundtypes.each { |el|
@@ -391,9 +421,13 @@ class UnitInferenceEngine
       end
 
       # Exactly one of the three unit positions must be unknown...
-      next unless [@inferred[apply], @inferred[children[0]], boundtype].inject(0) { |m,v|
+      undefcount = [@inferred[apply], @inferred[children[0]], boundtype].inject(0) { |m,v|
         m + case v.nil? when true then 1 else 0 end
-      } == 1
+      }
+      if undefcount != 1
+        blacklist(apply) if undefcount == 0
+        next
+      end
 
       @did_work = true
 
@@ -411,11 +445,11 @@ class UnitInferenceEngine
 
     apply_rule (['diff','partialdiff']) { |apply,children|
       # XXX partialdiff when >1 type involved...
-      boundtypes = REXML::XPath.match(apply, 'bvar/' + MathExpressionChild)
+      boundtypes = $xpath.match(apply, 'bvar/' + MathExpressionChild)
       boundtype = @inferred[boundtypes[0]]
 
       degree = 1.0
-      REXML::XPath.each(apply, '(bvar/degree/' + MathExpressionChild +
+      $xpath.each(apply, '(bvar/degree/' + MathExpressionChild +
                         ') or degree/' + MathExpressionChild) { |deg|
         if @inferred[deg].nil?
           @did_work = true
@@ -426,9 +460,13 @@ class UnitInferenceEngine
       }
 
       # Exactly one of the three unit positions must be unknown...
-      next unless [@inferred[apply], @inferred[children[0]], boundtype].inject(0) { |m,v|
+      undefcount = [@inferred[apply], @inferred[children[0]], boundtype].inject(0) { |m,v|
         m + case v.nil? when true then 1 else 0 end
-      } == 1
+      }
+      if undefcount != 1
+        blacklist(apply) if undefcount == 0
+        next
+      end
 
       @did_work = true
       
@@ -442,13 +480,17 @@ class UnitInferenceEngine
     }
 
     complex_rule ("descendant-or-self::piecewise") { |piecewise,children|
-      otherwise = REXML::XPath.first(piecewise, 'otherwise/' + MathExpressionChild)
-      match = [piecewise, otherwise] + REXML::XPath.match(piecewise, 'piece').map { |piece|
-        REXML::XPath.first(piece, MathExpressionChild)
+      otherwise = $xpath.first(piecewise, 'otherwise/' + MathExpressionChild)
+      match = [piecewise, otherwise] + $xpath.match(piecewise, 'piece').map { |piece|
+        $xpath.first(piece, MathExpressionChild)
       }
 
       # Everything in match has the same type. At least one must be unknown...
-      next if match.find { |x| @inferred[x].nil? }.nil?
+      if match.find { |x| @inferred[x].nil? }.nil?
+        blacklist apply
+        next
+      end
+      
       # and at least one must be known...
       known = match.find { |x| not @inferred[x].nil? }
       next if known.nil?
@@ -460,11 +502,17 @@ class UnitInferenceEngine
 
   def known_root(utype)
     if (@maths.name == "math")
-      root = REXML::XPath.first(@maths, MathExpressionChild)
+      root = $xpath.first(@maths, MathExpressionChild)
     else
       root = @maths
     end
     @inferred[root] = utype
+  end
+
+  def blacklist(apply)
+    ri = @ruleHits.find_index { |x| x[0] == @activeRule}
+    @ruleHits[ri][1].delete_if { |x,c| x == apply }
+    @ruleHits.delete_at(ri) if @ruleHits[ri][1].empty?
   end
 
   def infer
@@ -472,20 +520,26 @@ class UnitInferenceEngine
     known_variables
     dimensionless_constants
 
+    @ruleHits = @rules.map { |xpath,proc|
+      [proc, $xpath.match(@maths, xpath).map { |x|
+         [x, $xpath.match(x, MathExpressionChild)] }]
+    }
+
     @did_work = true
     while (@did_work)
       @did_work = false
       
-      @rules.each { |xpath,proc|
-        REXML::XPath.each(@maths, xpath) { |apply|
-          proc.call(apply, REXML::XPath.match(apply, MathExpressionChild))
+      @ruleHits.each { |proc,items|
+        @activeRule = proc
+        items.each { |apply, children|
+          proc.call(apply, children)
         }
       }
     end
   end
 
   def set_constant_units
-    REXML::XPath.each(@maths, 'descendant-or-self::cn') { |cn|
+    $xpath.each(@maths, 'descendant-or-self::cn') { |cn|
       cn.add_attribute('cellml:units', @unitSets.findOrMakeUnits(@inferred[cn])) unless @inferred[cn].nil?
     }
   end
@@ -501,13 +555,13 @@ class UnitInferenceEngine
   end
 
   def known_variables
-    REXML::XPath.each(@maths, "descendant::ci") { |ci|
+    $xpath.each(@maths, "descendant::ci") { |ci|
       @inferred[ci] = @unitSets.findUnits(@comps.units(ci.text.strip))
     }
   end
 
   def dimensionless_constants
-    REXML::XPath.each(@maths, 'descendant::exponentiale or descendant::imaginaryi or descendant::notanumber ' +
+    $xpath.each(@maths, 'descendant::exponentiale or descendant::imaginaryi or descendant::notanumber ' +
                       'or descendant::pi or descendant::eulergamma or descendant::infinity') { |el|
       @inferred[el] = Units::Dimensionless
     }
@@ -531,24 +585,40 @@ class ComponentConnector
 
   def register_variable(name, component, variable, units)
     raise "Invalid type of units" unless units.kind_of?(String)
+    raise "Invalid type of component" unless component.kind_of?(String)
     @varreg[name] = [component, variable, units]
   end
 
   def units(name)
+    if @varreg[name].nil?
+      raise SBMLError.new("Reference to undefined variable #{name}")
+    end
     @varreg[name][2]
+  end
+
+  def fix_if_local_ci(ci, component)
+    name = ci.text.strip
+    (component2, name2, units) = @varreg[name]
+    return false if name2 == name or component != component2
+
+    ci.text = name2
+    true
   end
 
   def connect(name, component, component2 = nil, units = nil)
     (component2, name2, units) = @varreg[name] if component2.nil?
     
+    raise "Expected component and component2 to be strings" unless
+      component.kind_of?(String) and component2.kind_of?(String)
+
     return units if component == component2
 
     # Look for an existing connection...
-    conn = REXML::XPath.match(@cellmlEl, "/model/connection[map_components[@component_1=\"#{component}\" and " +
+    conn = $xpath.match(@cellmlEl, "/model/connection[map_components[@component_1=\"#{component}\" and " +
                               "@component_2=\"#{component2}\"]]")
     return connect_vars(conn[0], name, name2, component, name, units) unless conn.size==0
 
-    conn = REXML::XPath.match(@cellmlEl, "/model/connection[map_components[@component_1=\"#{component2}\" and " +
+    conn = $xpath.match(@cellmlEl, "/model/connection[map_components[@component_1=\"#{component2}\" and " +
                               "@component_2=\"#{component}\"]]")
     return connect_vars(conn[0], name2, name, component, name, units) unless conn.size==0
 
@@ -558,12 +628,13 @@ class ComponentConnector
   end
 
   def connect_vars(conn, name1, name2, varcomp, varname, units)
-    return unless REXML::XPath.match(conn, "map_variables[@variable_1=\"#{name1}\" " +
+    raise "units parameter should be a string" unless units.kind_of? String
+    return unless $xpath.match(conn, "map_variables[@variable_1=\"#{name1}\" " +
                                      "and @variable_2=\"#{name2}\"]").size==0
 
     conn.add_element('map_variables', {'variable_1' => name1, 'variable_2' => name2})
 
-    REXML::XPath.each(@cellmlEl, "/model/component[@name=\"#{varcomp}\"]") { |el|
+    $xpath.each(@cellmlEl, "/model/component[@name=\"#{varcomp}\"]") { |el|
       el.add_element('variable', {'name' => varname, 'public_interface' => 'in',
                                   'units' => units})
     }
@@ -610,7 +681,7 @@ class SBMLToCellML
     raise SBMLError.new('Unexpected namespace %s' % @sbmlEl.namespace) unless @sbmlEl.namespace == @sbml_ns
     raise SBMLError.new('Unexpected element %s' % @sbmlEl.name) unless @sbmlEl.name == 'sbml'
 
-    id = REXML::XPath.first(@sbmlEl, '/sbml/model').attribute('id')
+    id = $xpath.first(@sbmlEl, '/sbml/model').attribute('id')
     @cellmlEl.add_attribute('name', id.value) unless id.nil?
 
     process_units
@@ -642,11 +713,11 @@ class SBMLToCellML
 
   def process_units
     @item_defined = false
-    REXML::XPath.each(@sbmlEl, '/sbml/model/listOfUnitDefinitions/unitDefinition') { |el|
+    $xpath.each(@sbmlEl, '/sbml/model/listOfUnitDefinitions/unitDefinition') { |el|
       utype = nil
       name = el.attribute('id').value
       units = @cellmlEl.add_element('units', {'name' => name})
-      REXML::XPath.each(el, 'listOfUnits/unit') { |u|
+      $xpath.each(el, 'listOfUnits/unit') { |u|
         kind = u.attribute('kind').value
         define_item if kind == "item"
         attrs = {'units' => kind }
@@ -682,7 +753,7 @@ class SBMLToCellML
   end
 
   def ensure_builtin_unit(name)
-    return unless REXML::XPath.first(@cellmlEl, "/model/units[@name=\"#{name}\"]").nil?
+    return unless $xpath.first(@cellmlEl, "/model/units[@name=\"#{name}\"]").nil?
 
     units = @cellmlEl.add_element('units', {'name' => name})
 
@@ -733,13 +804,13 @@ class SBMLToCellML
   def process_functions
     @functions = {}
 
-    REXML::XPath.each(@sbmlEl, '/sbml/model/listOfFunctionDefinitions/functionDefinition') { |el|
+    $xpath.each(@sbmlEl, '/sbml/model/listOfFunctionDefinitions/functionDefinition') { |el|
       name = el.attribute('id').value
-      lambda = REXML::XPath.first(el, 'math/lambda')
+      lambda = $xpath.first(el, 'math/lambda')
       raise SBMLError.new("Expected MathML lambda inside functionDefinition") if lambda.nil?
-      f = { :bvars => [], :expr => REXML::XPath.first(lambda, 'apply or ci')}
+      f = { :bvars => [], :expr => $xpath.first(lambda, 'apply or ci')}
       raise SBMLError.new("Expected an apply or ci element in MathML lambda") if f[:expr].nil?
-      REXML::XPath.each(lambda, 'bvar/ci') { |bvarci|
+      $xpath.each(lambda, 'bvar/ci') { |bvarci|
         f[:bvars].push(bvarci.text.strip)
       }
       @functions[name] = f
@@ -750,15 +821,10 @@ class SBMLToCellML
     el = expand_all_functions(el)
 
     # Make a CellML style time where we encounter the SBML csymbol
-    REXML::XPath.match(el, "descendant::csymbol[@definitionURL='http://www.sbml.org/sbml/symbols/time']").each { |csym|
+    $xpath.match(el, "descendant::csymbol[@definitionURL='http://www.sbml.org/sbml/symbols/time']").each { |csym|
       ci = REXML::Element.new('ci')
       ci.add_text('time')
       csym.parent.replace_child(csym, ci)
-    }
-
-    # Connect up all the ci elements to this component...
-    REXML::XPath.each(el, "descendant::ci") { |ci|
-      @comps.connect(ci.text.strip, component)
     }
 
     # Run the units inference engine...
@@ -766,6 +832,12 @@ class SBMLToCellML
     uie.known_root(target_units) unless target_units.nil?
     uie.infer
     uie.set_constant_units
+
+    # Connect up all the ci elements to this component...
+    $xpath.each(el, "descendant::ci") { |ci|
+      next if @comps.fix_if_local_ci(ci, component)
+      @comps.connect(ci.text.strip, component)
+    }
 
     el
   end
@@ -776,7 +848,7 @@ class SBMLToCellML
     good = true
     while good
       catch (:restart) do
-        REXML::XPath.match(clone_el, 'descendant::apply[ci]').each { |apply|
+        $xpath.match(clone_el, 'descendant::apply[ci]').each { |apply|
           new_el = expand_function(apply)
           next if new_el == apply
           apply.parent.replace_child(apply, new_el)
@@ -789,19 +861,15 @@ class SBMLToCellML
   end
 
   def expand_function(apply)
-    args = REXML::XPath.match(apply, MathAnyChild)
+    args = $xpath.match(apply, MathAnyChild)
     return apply unless (not args[0].nil?) and args[0].name == 'ci'
     f = @functions[args[0].text.strip]
     raise SBMLError.new("Attempt to apply a function not defined in listOfFunctionDefinitions") if f.nil?
     raise SBMLError.new("Incorrect number of arguments for user-defined function application") unless f[:bvars].size + 1 == args.size
     expr = f[:expr].deep_clone
-    REXML::XPath.each(expr, 'ci') { |el|
+    $xpath.each(expr, 'descendant::ci') { |el|
       index = f[:bvars].index(el.text.strip)
-      if not index.nil?
-        container = el.parent
-        container.delete_element(el)
-        container.add_element(args[index + 1].deep_clone)
-      end
+      el.parent.replace_child(el, args[index + 1].deep_clone) unless index.nil?
     }
     expr
   end
@@ -810,7 +878,7 @@ class SBMLToCellML
     @parameters = []
     paramComponent = @cellmlEl.add_element('component', {'name' => 'parameters'})
 
-    REXML::XPath.each(@sbmlEl, '/sbml/model/listOfParameters/parameter') { |el|
+    $xpath.each(@sbmlEl, '/sbml/model/listOfParameters/parameter') { |el|
       name = el.attribute('id').value
       attrs = {'name' => name, 'public_interface' => 'out'}
       attrs['initial_value'] = el.attribute('value').value unless el.attribute('value').nil?
@@ -818,6 +886,7 @@ class SBMLToCellML
         units = 'unknown'
       else
         units = el.attribute('units').value
+        define_item if units == 'item'
       end
 
       attrs['units'] = units
@@ -826,7 +895,7 @@ class SBMLToCellML
       var = paramComponent.add_element('variable', attrs)
       @comps.register_variable(name, 'parameters', name, units)
 
-      process_initial_assignment(name, units, paramComponent, var)
+      process_initial_assignment(name, name, units, paramComponent, var)
     }
 
     @cellmlEl.delete_element(paramComponent) if @parameters.empty?
@@ -851,6 +920,7 @@ class SBMLToCellML
               end
     else
       units = unitsAt.value
+      define_item if units == 'item'
     end
 
     ensure_builtin_unit(units) if not units.nil?
@@ -874,7 +944,7 @@ class SBMLToCellML
   def process_compartments
     @compartments = {}
 
-    REXML::XPath.each(@sbmlEl, '/sbml/model/listOfCompartments/compartment') { |el|
+    $xpath.each(@sbmlEl, '/sbml/model/listOfCompartments/compartment') { |el|
       name = el.attribute('id').value
       component = @cellmlEl.add_element('component', {'name' => name })
       units = compartment_spatial_units(el)
@@ -893,7 +963,7 @@ class SBMLToCellML
       var = component.add_element('variable', varAttrs)
 
       if size.nil?
-        process_initial_assignment(name, units, component, var)
+        process_initial_assignment(name, 'size', units, component, var)
       end
     }
   end
@@ -909,6 +979,7 @@ class SBMLToCellML
   end
 
   def compute_initial_value(component, varname, units)
+    raise "Units must be a string" unless units.kind_of?(String)
     ivvar = varname + '_initial'
     component.add_element('variable', {'name' => ivvar, 'units' => units})
 
@@ -919,7 +990,7 @@ class SBMLToCellML
 
   def process_species
     @species = {}
-    REXML::XPath.each(@sbmlEl, '/sbml/model/listOfSpecies/species') { |el|
+    $xpath.each(@sbmlEl, '/sbml/model/listOfSpecies/species') { |el|
       compartment = @compartments[el.attribute('compartment').value]
       name = el.attribute('id').value
 
@@ -976,25 +1047,31 @@ class SBMLToCellML
                          :units => @units.findUnits(units), :compartment => compartment }
 
       if consider_external_assignment
-        process_initial_assignment(name, units, compartment[:component], species)
+        process_initial_assignment(name, name, units, compartment[:component], species)
         # It might also be a rule...
       end
     }
   end
 
-  def process_initial_assignment(name, units, component, var)
-    smath = REXML::XPath.first(@sbmlEl, "/sbml/model/listOfInitialAssignments/" +
-                              "initialAssignment[@symbol=\"#{name}\"]/math")
+  def process_initial_assignment(sbml_name, cellml_name, units, component, var)
+    smath = $xpath.first(@sbmlEl, "/sbml/model/listOfInitialAssignments/" +
+                              "initialAssignment[@symbol=\"#{sbml_name}\"]/math")
     return false if smath.nil?
 
-    units = @units.findUnits(units)
-    smath = fix_maths(smath, component, units)
+    utype = @units.findUnits(units)
+    smath = fix_maths(smath, component.attribute('name').value, utype)
 
-    ivname = name + '_initial'
+    ivname = cellml_name + '_initial'
     var.add_attribute('initial_value', ivname)
     component.add_element('variable', {'name' => ivname, 'units' => units})
     add_math_apply_eq(component, ivname) { |applyeq|
-      apply = REXML::XPath.first(smath, MathExpressionChild)
+      apply = $xpath.first(smath, MathExpressionChild)
+      if sbml_name != cellml_name
+        $xpath.each(apply, ':descendant:ci') { |ci|
+          next if ci.text.strip != sbml_name
+          ci.text = cellml_name
+        }
+      end
       applyeq.add_element(apply)
     }
     true
@@ -1003,9 +1080,9 @@ class SBMLToCellML
   def process_rules
     ruleComponent = @cellmlEl.add_element('component', {'name' => 'rules'})
 
-    REXML::XPath.each(@sbmlEl, '/sbml/model/listOfRules/*[self::assignmentRule or self::algebraicRule or self::rateRule]') { |el|
+    $xpath.each(@sbmlEl, '/sbml/model/listOfRules/*[self::assignmentRule or self::algebraicRule or self::rateRule]') { |el|
       if el.name == 'algebraicRule'
-        smath = REXML::XPath.first(el, 'math')
+        smath = $xpath.first(el, 'math')
         smath = fix_maths(smath, 'rules', nil)
         ruleComponent.add_element(smath)
       else
@@ -1026,7 +1103,7 @@ class SBMLToCellML
             merge_with(@units.findUnits('time'), 1.0, -1.0)
         end
 
-        sexpr = REXML::XPath.first(el, 'math/' + MathExpressionChild)
+        sexpr = $xpath.first(el, 'math/' + MathExpressionChild)
         applyeq.add_element(fix_maths(sexpr, 'rules', units))
       end
     }
@@ -1039,15 +1116,15 @@ class SBMLToCellML
     substUnits = Units::Item if substUnits.nil?
     substPerTime = substUnits.merge_with(@units.findUnits('time'), 1.0, -1.0)
 
-    REXML::XPath.each(@sbmlEl, '/sbml/model/listOfReactions/reaction') { |el|
+    $xpath.each(@sbmlEl, '/sbml/model/listOfReactions/reaction') { |el|
       compname = el.attribute('id').value
       reactionComponent = @cellmlEl.add_element('component', {'name' => compname})
 
-      k = REXML::XPath.first(el, 'kineticLaw/math/' + MathExpressionChild)
+      k = $xpath.first(el, 'kineticLaw/math/' + MathExpressionChild)
       next if k.nil?
 
       @comps.push_context
-      REXML::XPath.each(el, "kineticLaw/listOfParameters/parameter") { |param|
+      $xpath.each(el, "kineticLaw/listOfParameters/parameter") { |param|
         name = param.attribute('id').value
         attrs = {'name' => name}
         attrs['initial_value'] = param.attribute('value').value unless param.attribute('value').nil?
@@ -1055,6 +1132,7 @@ class SBMLToCellML
           units = 'unknown'
         else
           units = param.attribute('units').value
+          define_item if units == 'item'
         end
 
         attrs['units'] = units
@@ -1062,7 +1140,7 @@ class SBMLToCellML
         var = reactionComponent.add_element('variable', attrs)
         @comps.register_variable(name, compname, name, units)
 
-        process_initial_assignment(name, units, reactionComponent, var)
+        process_initial_assignment(name, name, units, reactionComponent, var)
       }
       k = fix_maths(k, compname, substPerTime)
       @comps.pop_context
@@ -1070,7 +1148,7 @@ class SBMLToCellML
       [{:stoichFactor => -1, :xpath => 'listOfReactants/speciesReference'},
        {:stoichFactor => 1, :xpath => 'listOfProducts/speciesReference'}].each { |v|
         stoichFactor = v[:stoichFactor]
-        REXML::XPath.each(el, v[:xpath]) { |sr|
+        $xpath.each(el, v[:xpath]) { |sr|
           speciesName = sr.attribute('species').value
           species = @species[speciesName]
           @comps.connect(speciesName, compname)
@@ -1098,7 +1176,7 @@ class SBMLToCellML
             unitsFactorUnits = units.merge_with(preConversionUnits, 1.0, -1.0)
 
             if sr.attribute('stoichiometry').nil?
-              stoichMath = REXML::XPath.first(sr, 'stoichiometryMath/math/' + MathExpressionChild)
+              stoichMath = $xpath.first(sr, 'stoichiometryMath/math/' + MathExpressionChild)
               if stoichMath.nil?
                 stoichConstant = 1
               else
@@ -1145,6 +1223,9 @@ end
 begin
   SBMLToCellML.convert(REXML::Document.new(File.new(ARGV[0]))).write(STDOUT, 1)
   puts ""
-rescue SBMLError
-  STDERR.puts "Error: %s" % $!.why
+rescue SBMLError => e
+  STDERR.puts "Error: %s" % e.why
+rescue => e
+  STDERR.puts "Uncaught exception: #{e.class.to_s} (#{e.message}):\n" +
+    e.backtrace.join("\n")
 end
